@@ -5,7 +5,7 @@ import os
 import json
 import math
 from datetime import datetime, timedelta, date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import requests
 import pandas as pd
@@ -16,14 +16,8 @@ import pandas as pd
 # =========================
 API_BASE = "https://api.mashop.kr"
 
-# 대시보드 기본 선택 기간(버튼에 표시되는 기본 active)
 DEFAULT_DAYS_FOR_UI = int(os.environ.get("DAYS_FOR_REPORT", "14"))
-
-# 실행마다 API에서 가져오는 기간(누적 갱신용)
-# 30이면 최근 30일치 받아서 history.csv에 merge
 DAYS_TO_FETCH = int(os.environ.get("DAYS_TO_FETCH", "30"))
-
-# 요일 평균/최고최저 계산 시 평균 거래량이 너무 적으면(가격 튐) 제외
 MIN_TRADECOUNT = float(os.environ.get("MIN_TRADECOUNT", "5"))
 
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
@@ -96,7 +90,6 @@ def format_price_kr(x: float | int | None) -> str:
 
     if v >= 100_000_000:
         eok = v / 100_000_000
-        # 소수 1자리
         eok_r = round(eok, 1)
         if abs(eok_r - round(eok_r)) < 1e-9:
             return f"{int(round(eok_r))}억"
@@ -132,7 +125,6 @@ def fetch_period(keyword: str, start_date: str, end_date: str, session: requests
     r.raise_for_status()
     data = r.json()
 
-    # 일반적으로 list지만, 방어적으로 처리
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -184,7 +176,6 @@ def load_history() -> pd.DataFrame:
     if not os.path.exists(HISTORY_CSV_PATH):
         return pd.DataFrame(columns=["keyword", "mapName", "dateTime", "date", "time", "weekday", "price", "tradeCount", "timeUnit"])
 
-    # utf-8 또는 utf-8-sig 방어
     try:
         df = pd.read_csv(HISTORY_CSV_PATH, encoding="utf-8")
     except Exception:
@@ -213,15 +204,12 @@ def merge_history(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
     merged["keyword"] = merged["keyword"].astype(str)
     merged["dateTime"] = merged["dateTime"].astype(str)
 
-    # 중복 제거: keyword + dateTime
     merged = merged.drop_duplicates(subset=["keyword", "dateTime"], keep="last")
     merged = merged.sort_values(by=["keyword", "dateTime"], ascending=[True, True])
 
     merged["price"] = pd.to_numeric(merged["price"], errors="coerce")
     merged["tradeCount"] = pd.to_numeric(merged["tradeCount"], errors="coerce")
 
-    # date/time/weekday 보정(혹시 누락된 레코드 대비)
-    # (가능한 경우만)
     def _fill_row(row):
         if (not row.get("date")) or (not row.get("time")) or (not row.get("weekday")):
             try:
@@ -245,13 +233,6 @@ def save_history(df: pd.DataFrame):
 # 리포트 데이터 구성
 # =========================
 def build_daily_series_for_kw(hist: pd.DataFrame, kw: str) -> List[Dict[str, Any]]:
-    """
-    날짜별 선 그래프용 데이터:
-    - 한 날짜 = 한 라인
-    - x = HOUR_ORDER
-    - y = 시간대 가격
-    - hover = [time, price_str, trade_str, date, weekday]
-    """
     sub = hist[hist["keyword"] == kw].copy()
     if sub.empty:
         return []
@@ -298,10 +279,6 @@ def build_daily_series_for_kw(hist: pd.DataFrame, kw: str) -> List[Dict[str, Any
 
 
 def build_points_for_kw(hist: pd.DataFrame, kw: str, max_days: int = 60) -> List[Dict[str, Any]]:
-    """
-    요일 평균 그래프/요일별 최고최저 표를 클라이언트에서 계산하기 위한 '점' 데이터(가볍게)
-    최근 max_days만 전달.
-    """
     sub = hist[hist["keyword"] == kw].copy()
     if sub.empty:
         return []
@@ -317,7 +294,6 @@ def build_points_for_kw(hist: pd.DataFrame, kw: str, max_days: int = 60) -> List
         return []
 
     sub = sub.sort_values("dt")
-    # 같은 dateTime이 중복될 수 있으니 마지막 유지
     sub = sub.drop_duplicates(subset=["dateTime"], keep="last")
 
     sub["date"] = sub["dt"].dt.strftime("%Y-%m-%d")
@@ -341,8 +317,8 @@ def build_points_for_kw(hist: pd.DataFrame, kw: str, max_days: int = 60) -> List
 
 
 def build_report_html(maps: List[str], daily_series: Dict[str, Any], points: Dict[str, Any]) -> str:
-    # f-string 충돌(Plotly %{...}) 방지 위해 .format 사용
-    html = """<!doctype html>
+    # ✅ 중요: .format() 사용 금지 (JS 중괄호 때문에 KeyError 발생)
+    html = r"""<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8" />
@@ -350,88 +326,26 @@ def build_report_html(maps: List[str], daily_series: Dict[str, Any], points: Dic
 <title>MaShop 시세 대시보드</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
-  body {{
+  body {
     margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", Arial, sans-serif;
     background: #0b0f14;
     color: #e8eef6;
-  }}
-  .wrap {{
-    max-width: 1200px;
-    margin: 0 auto;
-    padding: 18px;
-  }}
-  .top {{
-    display: flex;
-    gap: 12px;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    margin-bottom: 12px;
-  }}
-  h1 {{
-    font-size: 18px;
-    margin: 0;
-    font-weight: 700;
-  }}
-  .sub {{
-    color: #a7b3c2;
-    font-size: 12px;
-    margin-top: 4px;
-  }}
-  .controls {{
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    flex-wrap: wrap;
-  }}
-  select, button {{
-    background: #111826;
-    border: 1px solid #223044;
-    color: #e8eef6;
-    padding: 8px 10px;
-    border-radius: 10px;
-    outline: none;
-    cursor: pointer;
-  }}
-  button.active {{
-    border-color: #4da3ff;
-  }}
-  .card {{
-    background: #0f1622;
-    border: 1px solid #1f2b3d;
-    border-radius: 14px;
-    padding: 12px;
-    margin-bottom: 12px;
-  }}
-  .small {{
-    color: #a7b3c2;
-    font-size: 12px;
-  }}
-  table {{
-    width: 100%;
-    border-collapse: collapse;
-    margin-top: 8px;
-  }}
-  th, td {{
-    padding: 8px 6px;
-    border-bottom: 1px solid #1f2b3d;
-    font-size: 13px;
-  }}
-  th {{
-    text-align: left;
-    color: #a7b3c2;
-    font-weight: 600;
-  }}
-  td.r {{
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-  }}
-  .hint {{
-    color: #6f8298;
-    font-size: 12px;
-    margin-top: 8px;
-  }}
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 18px; }
+  .top { display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap; margin-bottom:12px; }
+  h1 { font-size:18px; margin:0; font-weight:700; }
+  .sub { color:#a7b3c2; font-size:12px; margin-top:4px; }
+  .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  select, button { background:#111826; border:1px solid #223044; color:#e8eef6; padding:8px 10px; border-radius:10px; outline:none; cursor:pointer; }
+  button.active { border-color:#4da3ff; }
+  .card { background:#0f1622; border:1px solid #1f2b3d; border-radius:14px; padding:12px; margin-bottom:12px; }
+  .small { color:#a7b3c2; font-size:12px; }
+  table { width:100%; border-collapse:collapse; margin-top:8px; }
+  th, td { padding:8px 6px; border-bottom:1px solid #1f2b3d; font-size:13px; }
+  th { text-align:left; color:#a7b3c2; font-weight:600; }
+  td.r { text-align:right; font-variant-numeric: tabular-nums; }
+  .hint { color:#6f8298; font-size:12px; margin-top:8px; }
 </style>
 </head>
 <body>
@@ -444,7 +358,7 @@ def build_report_html(maps: List[str], daily_series: Dict[str, Any], points: Dic
       <div class="controls">
         <select id="kwSelect"></select>
         <button class="rangeBtn" data-days="7">7일</button>
-        <button class="rangeBtn active" data-days="{default_days}">{default_days}일</button>
+        <button class="rangeBtn active" data-days="__DEFAULT_DAYS__">__DEFAULT_DAYS__일</button>
         <button class="rangeBtn" data-days="30">30일</button>
       </div>
     </div>
@@ -458,77 +372,76 @@ def build_report_html(maps: List[str], daily_series: Dict[str, Any], points: Dic
 
     <div class="card">
       <b>📊 요일 평균 그래프 (분석용)</b>
-      <div class="small">월~일 최대 7줄 · 평균 거래량 {min_trade} 이상만 반영 · 표본수(n)도 툴팁에 표시</div>
+      <div class="small">월~일 최대 7줄 · 평균 거래량 __MIN_TRADE__ 이상만 반영 · 표본수(n)도 툴팁에 표시</div>
       <div id="chartWeek" style="height:520px;"></div>
     </div>
 
     <div class="card">
       <b>📋 요일별 최고가 / 최저가 (평균가 기준)</b>
-      <div class="small">선택 기간 기준 · 평균 거래량 {min_trade} 이상만 반영</div>
+      <div class="small">선택 기간 기준 · 평균 거래량 __MIN_TRADE__ 이상만 반영</div>
       <div id="weekTableWrap"></div>
     </div>
   </div>
 
 <script>
-const MAPS = {maps_json};
-const DAILY = {daily_json};
-const POINTS = {points_json};
-const HOUR_ORDER = {hour_order};
+const MAPS = __MAPS_JSON__;
+const DAILY = __DAILY_JSON__;
+const POINTS = __POINTS_JSON__;
+const HOUR_ORDER = __HOUR_ORDER__;
 const WEEK_ORDER = ["월","화","수","목","금","토","일"];
-const MIN_TRADE = {min_trade};
+const MIN_TRADE = __MIN_TRADE__;
 
-function setActiveRange(days) {{
-  document.querySelectorAll(".rangeBtn").forEach(btn => {{
+function setActiveRange(days) {
+  document.querySelectorAll(".rangeBtn").forEach(btn => {
     btn.classList.toggle("active", String(btn.dataset.days) === String(days));
-  }});
-}}
+  });
+}
 
-function formatPriceKrFromNumber(num) {{
+function formatPriceKrFromNumber(num) {
   if (num === null || num === undefined || isNaN(num)) return "-";
   const v = Number(num);
-  if (v >= 100000000) {{
+  if (v >= 100000000) {
     const eok = v / 100000000;
     const rounded = Math.round(eok * 10) / 10;
-    if (Math.abs(rounded - Math.round(rounded)) < 1e-9) return `${{Math.round(rounded)}}억`;
-    return `${{rounded}}억`;
-  }} else {{
+    if (Math.abs(rounded - Math.round(rounded)) < 1e-9) return `${Math.round(rounded)}억`;
+    return `${rounded}억`;
+  } else {
     const man = Math.round(v / 10000);
-    return `${{man}}만`;
-  }}
-}}
+    return `${man}만`;
+  }
+}
 
-function ymdToday() {{
+function ymdToday() {
   const d = new Date();
   const y = d.getFullYear();
   const m = String(d.getMonth()+1).padStart(2,"0");
   const day = String(d.getDate()).padStart(2,"0");
-  return `${{y}}-${{m}}-${{day}}`;
-}}
+  return `${y}-${m}-${day}`;
+}
 
-function ymdMinusDays(n) {{
+function ymdMinusDays(n) {
   const d = new Date();
   d.setDate(d.getDate() - n);
   const y = d.getFullYear();
   const m = String(d.getMonth()+1).padStart(2,"0");
   const day = String(d.getDate()).padStart(2,"0");
-  return `${{y}}-${{m}}-${{day}}`;
-}}
+  return `${y}-${m}-${day}`;
+}
 
-function filterPointsByDays(points, days) {{
+function filterPointsByDays(points, days) {
   const start = ymdMinusDays(days - 1);
-  // date는 "YYYY-MM-DD" → 문자열 비교 가능
   return points.filter(p => p.date >= start && p.date <= ymdToday());
-}}
+}
 
-function buildDailyTraces(kw, days) {{
+function buildDailyTraces(kw, days) {
   const packs = (DAILY[kw] || []);
   const start = ymdMinusDays(days - 1);
   const filtered = packs.filter(p => p.label >= start && p.label <= ymdToday());
 
   const traces = [];
-  filtered.forEach(s => {{
+  filtered.forEach(s => {
     const customdata = s.hover.map(h => [h[0], h[1], h[2], h[3], h[4]]);
-    traces.push({{
+    traces.push({
       x: s.x,
       y: s.y,
       type: "scatter",
@@ -537,57 +450,57 @@ function buildDailyTraces(kw, days) {{
       customdata: customdata,
       hovertemplate:
         "<b>" + s.label + "</b><br>" +
-        "날짜: %{{customdata[3]}} (%{{customdata[4]}})<br>" +
-        "시간: %{{customdata[0]}}<br>" +
-        "가격: %{{customdata[1]}}<br>" +
-        "거래: %{{customdata[2]}}건<extra></extra>",
+        "날짜: %{customdata[3]} (%{customdata[4]})<br>" +
+        "시간: %{customdata[0]}<br>" +
+        "가격: %{customdata[1]}<br>" +
+        "거래: %{customdata[2]}건<extra></extra>",
       connectgaps: false
-    }});
-  }});
+    });
+  });
   return traces;
-}}
+}
 
-function renderDailyChart(kw, days) {{
+function renderDailyChart(kw, days) {
   const traces = buildDailyTraces(kw, days);
-  const layout = {{
+  const layout = {
     title: kw,
     paper_bgcolor: "#0f1622",
     plot_bgcolor: "#0f1622",
-    font: {{ color: "#e8eef6" }},
-    margin: {{ l: 55, r: 20, t: 50, b: 50 }},
-    xaxis: {{
+    font: { color: "#e8eef6" },
+    margin: { l: 55, r: 20, t: 50, b: 50 },
+    xaxis: {
       type: "category",
       categoryorder: "array",
       categoryarray: HOUR_ORDER,
       title: "시간",
       gridcolor: "#1f2b3d",
       tickangle: -45
-    }},
-    yaxis: {{
+    },
+    yaxis: {
       title: "가격",
       gridcolor: "#1f2b3d",
       tickformat: ","
-    }},
+    },
     hovermode: "closest",
-    legend: {{ orientation: "h" }}
-  }};
-  Plotly.newPlot("chartDaily", traces, layout, {{ displayModeBar: true, responsive: true }});
-}}
+    legend: { orientation: "h" }
+  };
+  Plotly.newPlot("chartDaily", traces, layout, { displayModeBar: true, responsive: true });
+}
 
-function buildWeekAvgStats(kw, days) {{
+function buildWeekAvgStats(kw, days) {
   const ptsAll = (POINTS[kw] || []);
   const pts = filterPointsByDays(ptsAll, days);
 
   // stats[weekday][time] = {sumPrice, cnt, sumTrade}
-  const stats = {{}};
-  WEEK_ORDER.forEach(w => {{
-    stats[w] = {{}};
-    HOUR_ORDER.forEach(t => {{
-      stats[w][t] = {{ sumPrice: 0, cnt: 0, sumTrade: 0 }};
-    }});
-  }});
+  const stats = {};
+  WEEK_ORDER.forEach(w => {
+    stats[w] = {};
+    HOUR_ORDER.forEach(t => {
+      stats[w][t] = { sumPrice: 0, cnt: 0, sumTrade: 0 };
+    });
+  });
 
-  pts.forEach(p => {{
+  pts.forEach(p => {
     const w = p.weekday;
     const t = p.time;
     const price = Number(p.price);
@@ -601,52 +514,48 @@ function buildWeekAvgStats(kw, days) {{
     cell.sumPrice += price;
     cell.cnt += 1;
     if (trade !== null && !isNaN(trade)) cell.sumTrade += trade;
-  }});
+  });
 
-  // 평균 계산 + trade 필터 적용(평균 거래량 기준)
-  const avg = {{}};
-  WEEK_ORDER.forEach(w => {{
-    avg[w] = {{}};
-    HOUR_ORDER.forEach(t => {{
+  const avg = {};
+  WEEK_ORDER.forEach(w => {
+    avg[w] = {};
+    HOUR_ORDER.forEach(t => {
       const cell = stats[w][t];
-      if (cell.cnt <= 0) {{
-        avg[w][t] = {{ avgPrice: null, n: 0, avgTrade: null }};
+      if (cell.cnt <= 0) {
+        avg[w][t] = { avgPrice: null, n: 0, avgTrade: null };
         return;
-      }}
+      }
       const avgPrice = cell.sumPrice / cell.cnt;
-
-      // avgTrade는 tradeCount가 누락되면 정확하지 않을 수 있어도 참고용
       const avgTrade = cell.sumTrade / cell.cnt;
 
-      // 평균 거래량 필터(거래량이 너무 적으면 제외)
-      if (avgTrade !== null && !isNaN(avgTrade) && avgTrade < MIN_TRADE) {{
-        avg[w][t] = {{ avgPrice: null, n: cell.cnt, avgTrade: avgTrade }};
-      }} else {{
-        avg[w][t] = {{ avgPrice: avgPrice, n: cell.cnt, avgTrade: avgTrade }};
-      }}
-    }});
-  }});
+      if (avgTrade !== null && !isNaN(avgTrade) && avgTrade < MIN_TRADE) {
+        avg[w][t] = { avgPrice: null, n: cell.cnt, avgTrade: avgTrade };
+      } else {
+        avg[w][t] = { avgPrice: avgPrice, n: cell.cnt, avgTrade: avgTrade };
+      }
+    });
+  });
 
   return avg;
-}}
+}
 
-function buildWeekAvgTraces(kw, days) {{
+function buildWeekAvgTraces(kw, days) {
   const avg = buildWeekAvgStats(kw, days);
   const traces = [];
 
-  WEEK_ORDER.forEach(w => {{
+  WEEK_ORDER.forEach(w => {
     const y = [];
     const custom = [];
-    HOUR_ORDER.forEach(t => {{
+    HOUR_ORDER.forEach(t => {
       const cell = avg[w][t];
       y.push(cell.avgPrice === null ? null : cell.avgPrice);
       const pstr = (cell.avgPrice === null) ? "-" : formatPriceKrFromNumber(cell.avgPrice);
       const nstr = String(cell.n || 0);
       const trstr = (cell.avgTrade === null || isNaN(cell.avgTrade)) ? "-" : String(Math.round(cell.avgTrade));
       custom.push([w, t, pstr, nstr, trstr]);
-    }});
+    });
 
-    traces.push({{
+    traces.push({
       x: HOUR_ORDER,
       y: y,
       type: "scatter",
@@ -654,78 +563,71 @@ function buildWeekAvgTraces(kw, days) {{
       name: w,
       customdata: custom,
       hovertemplate:
-        "<b>%{{customdata[0]}}</b><br>" +
-        "시간: %{{customdata[1]}}<br>" +
-        "평균가: %{{customdata[2]}}<br>" +
-        "표본(n): %{{customdata[3]}}<br>" +
-        "평균거래: %{{customdata[4]}}건<extra></extra>",
+        "<b>%{customdata[0]}</b><br>" +
+        "시간: %{customdata[1]}<br>" +
+        "평균가: %{customdata[2]}<br>" +
+        "표본(n): %{customdata[3]}<br>" +
+        "평균거래: %{customdata[4]}건<extra></extra>",
       connectgaps: false
-    }});
-  }});
+    });
+  });
 
   return traces;
-}}
+}
 
-function renderWeekChart(kw, days) {{
+function renderWeekChart(kw, days) {
   const traces = buildWeekAvgTraces(kw, days);
-  const layout = {{
+  const layout = {
     title: kw + " · 요일 평균",
     paper_bgcolor: "#0f1622",
     plot_bgcolor: "#0f1622",
-    font: {{ color: "#e8eef6" }},
-    margin: {{ l: 55, r: 20, t: 50, b: 50 }},
-    xaxis: {{
+    font: { color: "#e8eef6" },
+    margin: { l: 55, r: 20, t: 50, b: 50 },
+    xaxis: {
       type: "category",
       categoryorder: "array",
       categoryarray: HOUR_ORDER,
       title: "시간",
       gridcolor: "#1f2b3d",
       tickangle: -45
-    }},
-    yaxis: {{
+    },
+    yaxis: {
       title: "평균 가격",
       gridcolor: "#1f2b3d",
       tickformat: ","
-    }},
+    },
     hovermode: "closest",
-    legend: {{ orientation: "h" }}
-  }};
-  Plotly.newPlot("chartWeek", traces, layout, {{ displayModeBar: true, responsive: true }});
-}}
+    legend: { orientation: "h" }
+  };
+  Plotly.newPlot("chartWeek", traces, layout, { displayModeBar: true, responsive: true });
+}
 
-function renderWeekTable(kw, days) {{
+function renderWeekTable(kw, days) {
   const avg = buildWeekAvgStats(kw, days);
   const wrap = document.getElementById("weekTableWrap");
 
-  // 요일별 best/worst
   const rows = [];
-  WEEK_ORDER.forEach(w => {{
+  WEEK_ORDER.forEach(w => {
     let bestT = "-", bestP = null;
     let worstT = "-", worstP = null;
 
-    HOUR_ORDER.forEach(t => {{
+    HOUR_ORDER.forEach(t => {
       const cell = avg[w][t];
       const p = cell.avgPrice;
       if (p === null || p === undefined || isNaN(p)) return;
 
-      if (bestP === null || p > bestP) {{
-        bestP = p;
-        bestT = t;
-      }}
-      if (worstP === null || p < worstP) {{
-        worstP = p;
-        worstT = t;
-      }}
-    }});
+      if (bestP === null || p > bestP) { bestP = p; bestT = t; }
+      if (worstP === null || p < worstP) { worstP = p; worstT = t; }
+    });
 
-    rows.push({{
+    rows.push({
       weekday: w,
       best_time: bestT,
       best_price_str: bestP === null ? "-" : formatPriceKrFromNumber(bestP),
       worst_time: worstT,
       worst_price_str: worstP === null ? "-" : formatPriceKrFromNumber(worstP),
-    }});
-  }});
+    });
+  });
 
   let html = `
     <table>
@@ -741,67 +643,68 @@ function renderWeekTable(kw, days) {{
       <tbody>
   `;
 
-  rows.forEach(r => {{
+  rows.forEach(r => {
     html += `
       <tr>
-        <td>${{r.weekday}}</td>
-        <td>${{r.best_time}}</td>
-        <td class="r">${{r.best_price_str}}</td>
-        <td>${{r.worst_time}}</td>
-        <td class="r">${{r.worst_price_str}}</td>
+        <td>${r.weekday}</td>
+        <td>${r.best_time}</td>
+        <td class="r">${r.best_price_str}</td>
+        <td>${r.worst_time}</td>
+        <td class="r">${r.worst_price_str}</td>
       </tr>
     `;
-  }});
+  });
 
   html += `</tbody></table>`;
   wrap.innerHTML = html;
-}}
+}
 
-function init() {{
+function init() {
   const kwSelect = document.getElementById("kwSelect");
-  MAPS.forEach(k => {{
+  MAPS.forEach(k => {
     const opt = document.createElement("option");
     opt.value = k;
     opt.textContent = k;
     kwSelect.appendChild(opt);
-  }});
+  });
 
-  let currentDays = {default_days};
+  let currentDays = __DEFAULT_DAYS__;
   if (kwSelect.options.length) kwSelect.value = MAPS[0];
 
-  function rerender() {{
+  function rerender() {
     const kw = kwSelect.value;
     renderDailyChart(kw, currentDays);
     renderWeekChart(kw, currentDays);
     renderWeekTable(kw, currentDays);
-  }}
+  }
 
   kwSelect.addEventListener("change", () => rerender());
 
-  document.querySelectorAll(".rangeBtn").forEach(btn => {{
-    btn.addEventListener("click", () => {{
+  document.querySelectorAll(".rangeBtn").forEach(btn => {
+    btn.addEventListener("click", () => {
       currentDays = Number(btn.dataset.days);
       setActiveRange(currentDays);
       rerender();
-    }});
-  }});
+    });
+  });
 
   setActiveRange(currentDays);
   rerender();
-}}
+}
 
 init();
 </script>
 </body>
 </html>
-""".format(
-        default_days=DEFAULT_DAYS_FOR_UI,
-        min_trade=MIN_TRADECOUNT,
-        maps_json=json.dumps(maps, ensure_ascii=False),
-        daily_json=json.dumps(daily_series, ensure_ascii=False),
-        points_json=json.dumps(points, ensure_ascii=False),
-        hour_order=json.dumps(HOUR_ORDER, ensure_ascii=False),
-    )
+"""
+
+    # ✅ 안전한 토큰 치환(중괄호 문제 없음)
+    html = html.replace("__DEFAULT_DAYS__", str(DEFAULT_DAYS_FOR_UI))
+    html = html.replace("__MIN_TRADE__", str(MIN_TRADECOUNT))
+    html = html.replace("__MAPS_JSON__", json.dumps(maps, ensure_ascii=False))
+    html = html.replace("__DAILY_JSON__", json.dumps(daily_series, ensure_ascii=False))
+    html = html.replace("__POINTS_JSON__", json.dumps(points, ensure_ascii=False))
+    html = html.replace("__HOUR_ORDER__", json.dumps(HOUR_ORDER, ensure_ascii=False))
 
     return html
 
@@ -839,7 +742,6 @@ def main():
     merged = merge_history(old_hist, new_hist)
     save_history(merged)
 
-    # 대시보드 데이터 구성
     daily_series: Dict[str, Any] = {}
     points: Dict[str, Any] = {}
 
