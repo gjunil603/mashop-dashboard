@@ -1,8 +1,11 @@
+# mashop/storage.py
 from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Tuple
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, List, Tuple
 
 import pandas as pd
 
@@ -10,9 +13,17 @@ from .config import MAPS_DIR
 from .util import ensure_dir, windows_safe_slug
 
 
+# -------------------------
+# maps.json 로드
+# -------------------------
 def load_maps_list(maps_json_path: str) -> List[str]:
+    """
+    maps.json 예시:
+      ["미나르숲:남겨진 용의 둥지", "아쿠아로드:깊은 바다 협곡 2"]
+    """
     if not os.path.exists(maps_json_path):
         raise FileNotFoundError(f"{maps_json_path} 파일이 없습니다.")
+
     with open(maps_json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -25,9 +36,15 @@ def load_maps_list(maps_json_path: str) -> List[str]:
     return maps
 
 
+# -------------------------
+# 사냥터별 경로
+# -------------------------
 def map_paths(keyword: str) -> Tuple[str, str, str]:
     """
     returns (map_dir, history_csv_path, raw_dump_dir)
+    - map_dir:      data/maps/<slug>/
+    - history.csv:  data/maps/<slug>/history.csv
+    - raw_dump_dir: data/maps/<slug>/raw_dump/
     """
     slug = windows_safe_slug(keyword)
     map_dir = os.path.join(MAPS_DIR, slug)
@@ -36,10 +53,26 @@ def map_paths(keyword: str) -> Tuple[str, str, str]:
     return map_dir, history_path, raw_dump_dir
 
 
+def get_raw_dump_dir(keyword: str) -> Path:
+    """
+    raw_dump 디렉토리(Path) 반환 (없으면 생성은 안 함)
+    """
+    _, _, raw_dir = map_paths(keyword)
+    return Path(raw_dir)
+
+
+# -------------------------
+# history.csv 읽기/쓰기
+# -------------------------
 def read_history(keyword: str) -> pd.DataFrame:
+    """
+    사냥터별 history.csv 로드
+    """
     _, history_path, _ = map_paths(keyword)
     if not os.path.exists(history_path):
-        return pd.DataFrame(columns=["dateTime", "date", "time", "weekday", "price", "tradeCount", "timeUnit", "mapName"])
+        return pd.DataFrame(
+            columns=["dateTime", "date", "time", "weekday", "price", "tradeCount", "timeUnit", "mapName"]
+        )
 
     try:
         df = pd.read_csv(history_path, encoding="utf-8")
@@ -58,20 +91,36 @@ def read_history(keyword: str) -> pd.DataFrame:
 
 
 def write_history(keyword: str, df: pd.DataFrame) -> None:
+    """
+    사냥터별 history.csv 저장 (폴더 자동 생성)
+    """
     map_dir, history_path, raw_dump_dir = map_paths(keyword)
     ensure_dir(map_dir)
     ensure_dir(raw_dump_dir)
     df.to_csv(history_path, index=False, encoding="utf-8")
 
 
-def dump_raw(keyword: str, filename: str, obj: Any) -> None:
+# -------------------------
+# raw_dump 저장
+# -------------------------
+def dump_raw(keyword: str, filename: str, obj: Any) -> Path:
+    """
+    API 원본 응답(raw json)을 저장.
+    반환: 저장된 파일 Path
+    """
     map_dir, _, raw_dump_dir = map_paths(keyword)
     ensure_dir(map_dir)
     ensure_dir(raw_dump_dir)
-    path = os.path.join(raw_dump_dir, filename)
+
+    path = Path(raw_dump_dir) / filename
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+    return path
 
+
+# -------------------------
+# history 오래된 데이터 정리(최근 N일만 유지)
+# -------------------------
 def _ensure_datetime_col(df: pd.DataFrame, col: str = "dateTime") -> pd.Series:
     """
     df[col]을 pandas datetime으로 안전하게 변환한 Series 반환
@@ -111,7 +160,34 @@ def trim_history_days(df: pd.DataFrame, keep_days: int, col: str = "dateTime") -
     keep_mask = ts2 >= cutoff
     df3 = df2.loc[keep_mask].copy()
 
-    # 정렬(있으면 안정적)
+    # 정렬 안정화
     df3[col] = pd.to_datetime(df3[col], errors="coerce")
     df3 = df3.sort_values(col).reset_index(drop=True)
     return df3
+
+
+# -------------------------
+# raw_dump 오래된 파일 정리(최근 N일만 유지)
+# -------------------------
+def cleanup_raw_dump(raw_dir: Path, keep_days: int) -> None:
+    """
+    raw_dump 폴더에서 keep_days보다 오래된 json 파일 삭제
+    기준: 파일 수정 시각(mtime, UTC)
+    """
+    if not raw_dir.exists() or not raw_dir.is_dir():
+        return
+
+    cutoff = datetime.utcnow() - timedelta(days=int(keep_days))
+
+    for p in raw_dir.glob("*.json"):
+        try:
+            mtime = datetime.utcfromtimestamp(p.stat().st_mtime)
+        except Exception:
+            continue
+
+        if mtime < cutoff:
+            try:
+                p.unlink()
+                print(f"[CLEAN] raw_dump removed: {p.name}")
+            except Exception as e:
+                print(f"[WARN] raw_dump remove failed: {p.name} -> {e}")
