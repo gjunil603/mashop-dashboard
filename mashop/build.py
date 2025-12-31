@@ -25,6 +25,8 @@ from .api import fetch_period
 from .storage import load_maps_list, read_history, write_history, dump_raw
 from .util import ensure_dir, parse_dt, weekday_kr, last_n_days_range
 from .report import build_report_html
+from mashop.config import KEEP_DAYS
+from mashop.storage import trim_history_days
 
 
 def _collect_recent_df(session: requests.Session, keyword: str, days_to_fetch: int) -> pd.DataFrame:
@@ -245,6 +247,8 @@ def main():
             new_df = pd.DataFrame(columns=(old_df.columns if old_df is not None else []))
     
         merged = _merge_history(old_df, new_df)
+        # ✅ 오래된 데이터 자동 정리 (최근 180일만 유지)
+        merged = trim_history_days(merged, KEEP_DAYS)
         write_history(kw, merged)
         per_map_history[kw] = merged
     
