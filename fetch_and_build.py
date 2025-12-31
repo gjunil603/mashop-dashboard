@@ -1,401 +1,745 @@
-import json
+# fetch_and_build.py
+from __future__ import annotations
+
 import os
-from datetime import datetime, timedelta
+import json
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta, date
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
 import pandas as pd
 
-API = "https://api.mashop.kr/api/v2/maps/price-stat/period"
+
+# =========================
+# 설정값
+# =========================
+API_BASE = "https://api.mashop.kr"
+
+# 리포트(대시보드)에서 분석에 쓸 기간(최근 N일)
+DAYS_FOR_REPORT = int(os.environ.get("DAYS_FOR_REPORT", "14"))
+
+# 데이터 누적 저장(히스토리) 시, 매 실행마다 최근 N일을 가져와 합치는 방식
+# (너무 길게 가져오면 느려지니 적당히)
+DAYS_TO_FETCH = int(os.environ.get("DAYS_TO_FETCH", "30"))
+
+# 거래량 필터(평균 거래량이 너무 적으면 가격 튐이 심해서 제외)
+MIN_TRADECOUNT = float(os.environ.get("MIN_TRADECOUNT", "5"))
+
+# 타임존: mashop API의 dateTime이 한국시간 형태로 오는 것으로 가정(문자열에 TZ 없음)
+# (실제론 서버/브라우저에 따라 다를 수 있으나, 네 테스트 데이터 기준 KST로 맞춰 처리)
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
-# 사이트 시간축(01~23,00)
-HOUR_ORDER = list(range(1, 24)) + [0]
-HOUR_LABELS = [f"{h:02d}:00" for h in HOUR_ORDER]
+DATA_DIR = "data"
+DOCS_DIR = "docs"
+MAPS_JSON_PATH = "maps.json"
+HISTORY_CSV_PATH = os.path.join(DATA_DIR, "history.csv")
+INDEX_HTML_PATH = os.path.join(DOCS_DIR, "index.html")
+RAW_DUMP_DIR = os.path.join(DATA_DIR, "raw_dump")
 
-DATA_PATH = "data/history.csv"
-DOCS_PATH = "docs/index.html"
-MAPS_PATH = "maps.json"
-
-# ===== 설정값 (원하면 나중에 maps.json에 옮길 수 있음) =====
-DAYS_FOR_REPORT = 14          # 웹페이지에서 기본 표시 기간(최근 N일)
-MIN_TRADECOUNT = 10           # 추천 판매시간 계산 시 최소 거래건수(평균 기준)
+# 사이트 차트처럼 "01:00 ~ 23:00, 00:00" 순서로 보이게
+HOUR_ORDER = [f"{h:02d}:00" for h in range(1, 24)] + ["00:00"]
 
 
-def format_price_kr(price) -> str:
-    if price is None or (isinstance(price, float) and pd.isna(price)):
+# =========================
+# 유틸
+# =========================
+def ensure_dirs():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(DOCS_DIR, exist_ok=True)
+    os.makedirs(RAW_DUMP_DIR, exist_ok=True)
+
+
+def load_maps() -> List[str]:
+    if not os.path.exists(MAPS_JSON_PATH):
+        raise FileNotFoundError(f"{MAPS_JSON_PATH} 파일이 없습니다. maps.json을 먼저 추가하세요.")
+    with open(MAPS_JSON_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        maps = [str(x).strip() for x in data if str(x).strip()]
+        if not maps:
+            raise ValueError("maps.json이 비어있습니다. 맵 이름을 1개 이상 넣어주세요.")
+        return maps
+    raise ValueError("maps.json 형식이 잘못되었습니다. 예: [\"미나르숲:남겨진 용의 둥지\", \"...\" ]")
+
+
+def parse_dt_kst(dt_str: str) -> datetime:
+    # 예: "2025-12-31T01:00:00"
+    # TZ 정보 없음 -> 한국시간으로 간주(naive)
+    return datetime.fromisoformat(dt_str)
+
+
+def to_date_str(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+
+def to_time_str(dt: datetime) -> str:
+    return dt.strftime("%H:%M")
+
+
+def weekday_kr(dt: datetime) -> str:
+    return WEEKDAY_KR[dt.weekday()]
+
+
+def format_price_kr(x: float | int | None) -> str:
+    """
+    7,000,000 -> 700만
+    17,000,000 -> 1700만
+    120,000,000 -> 1.2억
+    100,000,000 -> 1억
+    """
+    if x is None:
         return "-"
-    p = int(price)
-    if p >= 100_000_000:
-        eok = p // 100_000_000
-        man = (p % 100_000_000) // 10_000
-        return f"{eok}억 {man:,}만" if man else f"{eok}억"
-    return f"{p // 10_000:,}만"
+    try:
+        v = float(x)
+    except Exception:
+        return "-"
+
+    if math.isnan(v):
+        return "-"
+
+    if v < 0:
+        v = abs(v)
+
+    if v >= 100_000_000:
+        eok = v / 100_000_000
+        if abs(eok - round(eok)) < 1e-9:
+            return f"{int(round(eok))}억"
+        # 소수 1자리까지만
+        return f"{eok:.1f}억".rstrip("0").rstrip(".") + "억" if not str(eok).endswith("0") else f"{eok:.1f}억"
+    else:
+        man = int(round(v / 10_000))
+        return f"{man}만"
 
 
-def parse_dt_seoul(dt_str: str):
+def safe_json_dump(path: str, obj: Any):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+# =========================
+# API 수집
+# =========================
+def fetch_period(keyword: str, start_date: str, end_date: str, session: Optional[requests.Session] = None) -> List[Dict[str, Any]]:
     """
-    mashop API dateTime이 tz 없이 내려오는 케이스가 있어 UTC로 가정 -> KST 변환
+    GET /api/v2/maps/price-stat/period?keyword=...&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
     """
-    if not dt_str:
-        return pd.NaT
-    s = str(dt_str)
-    dt = pd.to_datetime(s, errors="coerce")
-    if pd.isna(dt):
-        return pd.NaT
-    if dt.tzinfo is None:
-        return pd.to_datetime(s, utc=True).tz_convert("Asia/Seoul").tz_localize(None)
-    return dt.tz_convert("Asia/Seoul").tz_localize(None)
-
-
-def daterange_days(end_date: pd.Timestamp, days: int):
-    start = (end_date - pd.Timedelta(days=days - 1)).date()
-    end = end_date.date()
-    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
-
-
-def load_maps():
-    with open(MAPS_PATH, "r", encoding="utf-8") as f:
-        j = json.load(f)
-    maps = j.get("maps", [])
-    maps = [m.strip() for m in maps if m and str(m).strip()]
-    if not maps:
-        raise ValueError("maps.json에 maps 목록이 비었습니다.")
-    return maps
-
-
-def fetch_period(keyword: str, start_date: str, end_date: str):
-    params = {"keyword": keyword, "startDate": start_date, "endDate": end_date}
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-    r = requests.get(API, params=params, headers=headers, timeout=60)
+    s = session or requests.Session()
+    url = f"{API_BASE}/api/v2/maps/price-stat/period"
+    params = {
+        "keyword": keyword,
+        "startDate": start_date,
+        "endDate": end_date,
+    }
+    r = s.get(url, params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
-    if not isinstance(data, list):
-        raise ValueError(f"Unexpected JSON shape: {type(data)}")
-    return data
+    # 보통 list 형태. 만약 dict 형태면 내부 키 탐색
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        # 흔한 케이스 방어
+        for k in ["data", "items", "result", "content"]:
+            if k in data and isinstance(data[k], list):
+                return data[k]
+    return []
 
 
-def ensure_dirs():
-    os.makedirs("data", exist_ok=True)
-    os.makedirs("docs", exist_ok=True)
+def last_n_days_range(n: int, include_today: bool = True) -> Tuple[str, str]:
+    """
+    - n=7이면: 오늘 포함해서 최근 7일 범위
+    - start는 'n일-1일 전' 00:00 기준으로 API에 날짜만 던짐
+    """
+    today = date.today()
+    if include_today:
+        start = today - timedelta(days=n - 1)
+        end = today
+    else:
+        start = today - timedelta(days=n)
+        end = today - timedelta(days=1)
+    return start.isoformat(), end.isoformat()
 
 
-def load_history():
-    if os.path.exists(DATA_PATH):
-        df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
-        return df
-    return pd.DataFrame(columns=[
-        "mapName", "keyword", "date", "weekday", "hour", "time", "dateTime",
-        "price", "tradeCount", "timeUnit"
-    ])
+def collect_recent(keyword: str, days_to_fetch: int, session: requests.Session) -> pd.DataFrame:
+    start_date, end_date = last_n_days_range(days_to_fetch, include_today=True)
+    rows = fetch_period(keyword, start_date, end_date, session=session)
+
+    # raw dump 저장(디버깅용)
+    dump_path = os.path.join(RAW_DUMP_DIR, f"{keyword}_{start_date}_to_{end_date}.json")
+    safe_json_dump(dump_path, rows)
+
+    out = []
+    for it in rows:
+        dt_s = it.get("dateTime")
+        price = it.get("price")
+        tc = it.get("tradeCount")
+        if not dt_s:
+            continue
+        try:
+            dt = parse_dt_kst(str(dt_s))
+        except Exception:
+            continue
+
+        out.append({
+            "keyword": keyword,
+            "mapName": it.get("mapName", keyword),
+            "dateTime": dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "date": to_date_str(dt),
+            "time": to_time_str(dt),
+            "weekday": weekday_kr(dt),
+            "price": float(price) if price is not None else None,
+            "tradeCount": float(tc) if tc is not None else None,
+            "timeUnit": it.get("timeUnit"),
+        })
+
+    df = pd.DataFrame(out)
+    return df
+
+
+# =========================
+# 히스토리 누적/정리
+# =========================
+def load_history() -> pd.DataFrame:
+    if not os.path.exists(HISTORY_CSV_PATH):
+        return pd.DataFrame(columns=["keyword", "mapName", "dateTime", "date", "time", "weekday", "price", "tradeCount", "timeUnit"])
+    try:
+        df = pd.read_csv(HISTORY_CSV_PATH, encoding="utf-8")
+    except Exception:
+        df = pd.read_csv(HISTORY_CSV_PATH, encoding="utf-8-sig")
+
+    # 필드 보정
+    for col in ["keyword", "dateTime", "date", "time", "weekday", "mapName", "timeUnit"]:
+        if col not in df.columns:
+            df[col] = None
+    for col in ["price", "tradeCount"]:
+        if col not in df.columns:
+            df[col] = None
+    return df
+
+
+def merge_history(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    if old_df is None or old_df.empty:
+        merged = new_df.copy()
+    elif new_df is None or new_df.empty:
+        merged = old_df.copy()
+    else:
+        merged = pd.concat([old_df, new_df], ignore_index=True)
+
+    # 중복 제거: keyword + dateTime 기준
+    merged["keyword"] = merged["keyword"].astype(str)
+    merged["dateTime"] = merged["dateTime"].astype(str)
+    merged = merged.drop_duplicates(subset=["keyword", "dateTime"], keep="last")
+
+    # 정렬
+    merged = merged.sort_values(by=["keyword", "dateTime"], ascending=[True, True])
+
+    # NaN 보정
+    if "tradeCount" in merged.columns:
+        merged["tradeCount"] = pd.to_numeric(merged["tradeCount"], errors="coerce")
+    merged["price"] = pd.to_numeric(merged["price"], errors="coerce")
+
+    return merged
 
 
 def save_history(df: pd.DataFrame):
-    df.to_csv(DATA_PATH, index=False, encoding="utf-8-sig")
+    df.to_csv(HISTORY_CSV_PATH, index=False, encoding="utf-8")
 
 
-def build_report(df_all: pd.DataFrame, maps: list[str], days_for_report: int):
-    # 기준일: df 내 최대 dateTime
-    df_all["dateTime_dt"] = pd.to_datetime(df_all["dateTime"], errors="coerce")
-    df_all = df_all.dropna(subset=["dateTime_dt"])
-    max_dt = df_all["dateTime_dt"].max()
-    start_s, end_s = daterange_days(max_dt, days_for_report)
+# =========================
+# 리포트(대시보드) 생성
+# =========================
+@dataclass
+class SeriesPack:
+    label: str               # 날짜 라벨
+    x: List[str]             # 시간축 (HOUR_ORDER)
+    y: List[Optional[float]] # 가격
+    hover: List[List[str]]   # customdata: [time, price_str, trade_str, date, weekday]
 
-    # 최근 N일만 필터
-    sdt = pd.to_datetime(start_s)
-    edt = pd.to_datetime(end_s) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-    df = df_all[(df_all["dateTime_dt"] >= sdt) & (df_all["dateTime_dt"] <= edt)].copy()
 
-    # 사냥터 목록 정렬(드롭다운)
-    maps_sorted = [m for m in maps if m in set(df["keyword"].unique())] + [m for m in maps if m not in set(df["keyword"].unique())]
+def build_series_for_kw(hist: pd.DataFrame, kw: str, days_for_report: int) -> List[SeriesPack]:
+    """
+    kw에 대해 최근 N일의 날짜별 라인(각 날짜가 한 라인) 생성
+    """
+    sub = hist[hist["keyword"] == kw].copy()
+    if sub.empty:
+        return []
 
-    # 사냥터별 추천 판매시간 TOP3 만들기
-    # 기준: (요일,시간) 평균가격이 높은 순 / 거래건수 평균이 MIN_TRADECOUNT 이상
-    rec = {}
-    for kw in maps_sorted:
-        sub = df[df["keyword"] == kw].copy()
-        if sub.empty:
-            rec[kw] = []
+    # 최근 N일로 제한
+    sub["dt"] = pd.to_datetime(sub["dateTime"], errors="coerce")
+    sub = sub.dropna(subset=["dt"])
+    cutoff = datetime.now() - timedelta(days=days_for_report)
+    sub = sub[sub["dt"] >= cutoff]
+    if sub.empty:
+        return []
+
+    # 날짜별로 분리
+    sub["date"] = sub["dt"].dt.strftime("%Y-%m-%d")
+    sub["time"] = sub["dt"].dt.strftime("%H:%M")
+    sub["weekday"] = sub["dt"].dt.weekday.map(lambda i: WEEKDAY_KR[int(i)])
+
+    packs: List[SeriesPack] = []
+    for d, g in sub.groupby("date", as_index=False):
+        # 시간별 하나로 맞추기 (중복이 있으면 마지막 값)
+        g = g.sort_values("dt")
+        last_by_time = g.drop_duplicates(subset=["time"], keep="last")
+
+        # dict로 빠르게 매핑
+        price_map = {row["time"]: row["price"] for _, row in last_by_time.iterrows()}
+        tc_map = {row["time"]: row.get("tradeCount") for _, row in last_by_time.iterrows()}
+        wd_map = {row["time"]: row.get("weekday") for _, row in last_by_time.iterrows()}
+
+        x = HOUR_ORDER[:]
+        y = []
+        hover = []
+        for t in x:
+            p = price_map.get(t, None)
+            tc = tc_map.get(t, None)
+            wd = wd_map.get(t, None) or "-"
+            if p is None or (isinstance(p, float) and math.isnan(p)):
+                y.append(None)
+                hover.append([t, "-", "-", d, wd])
+            else:
+                y.append(float(p))
+                hover.append([
+                    t,
+                    format_price_kr(float(p)),
+                    str(int(tc)) if tc is not None and not (isinstance(tc, float) and math.isnan(tc)) else "-",
+                    d,
+                    wd
+                ])
+
+        packs.append(SeriesPack(label=d, x=x, y=y, hover=hover))
+
+    # 날짜 정렬(오래된 -> 최신)
+    packs.sort(key=lambda p: p.label)
+    return packs
+
+
+def compute_weekday_extrema(hist: pd.DataFrame, kw: str, days_for_report: int) -> List[Dict[str, Any]]:
+    """
+    최근 N일 동안:
+    요일(월~일)별로 시간대 평균 가격(avg_price)을 만들고
+    - 최고가 시간 (avg_price 최대)
+    - 최저가 시간 (avg_price 최소)
+    """
+    sub = hist[hist["keyword"] == kw].copy()
+    if sub.empty:
+        return []
+
+    sub["dt"] = pd.to_datetime(sub["dateTime"], errors="coerce")
+    sub = sub.dropna(subset=["dt"])
+    cutoff = datetime.now() - timedelta(days=days_for_report)
+    sub = sub[sub["dt"] >= cutoff]
+    if sub.empty:
+        return []
+
+    sub["weekday"] = sub["dt"].dt.weekday.map(lambda i: WEEKDAY_KR[int(i)])
+    sub["time"] = sub["dt"].dt.strftime("%H:%M")
+
+    # 그룹 평균
+    g = sub.groupby(["weekday", "time"], as_index=False).agg(
+        avg_price=("price", "mean"),
+        avg_trade=("tradeCount", "mean"),
+        n=("price", "count")
+    )
+    g["avg_price"] = pd.to_numeric(g["avg_price"], errors="coerce")
+    g["avg_trade"] = pd.to_numeric(g["avg_trade"], errors="coerce").fillna(0)
+
+    # 거래량 필터(원하면 여기 한 줄 삭제하면 됨)
+    g = g[g["avg_trade"] >= MIN_TRADECOUNT]
+
+    rows = []
+    for wd in WEEKDAY_KR:
+        gw = g[g["weekday"] == wd].copy()
+        if gw.empty:
+            rows.append({
+                "weekday": wd,
+                "best_time": "-",
+                "best_price_str": "-",
+                "worst_time": "-",
+                "worst_price_str": "-"
+            })
             continue
 
-        g = sub.groupby(["weekday", "time"], as_index=False).agg(
-            avg_price=("price", "mean"),
-            avg_trade=("tradeCount", "mean"),
-            n=("price", "count")
-        )
-        g = g.dropna(subset=["avg_price"])
-        g["avg_trade"] = g["avg_trade"].fillna(0)
-        g = g[g["avg_trade"] >= MIN_TRADECOUNT]
+        best = gw.loc[gw["avg_price"].idxmax()]
+        worst = gw.loc[gw["avg_price"].idxmin()]
 
-        g = g.sort_values("avg_price", ascending=False).head(3)
+        rows.append({
+            "weekday": wd,
+            "best_time": str(best["time"]),
+            "best_price_str": format_price_kr(float(best["avg_price"])),
+            "worst_time": str(worst["time"]),
+            "worst_price_str": format_price_kr(float(worst["avg_price"]))
+        })
+    return rows
 
-        items = []
-        for _, r in g.iterrows():
-            items.append({
-                "weekday": r["weekday"],
-                "time": r["time"],
-                "avg_price": float(r["avg_price"]),
-                "avg_price_str": format_price_kr(r["avg_price"]),
-                "avg_trade": int(round(r["avg_trade"])),
-                "n": int(r["n"])
-            })
-        rec[kw] = items
 
-    # Plotly에 넘길 데이터(사냥터/날짜별 라인)
-    # 사이트 방식: 01~23은 해당 날짜, 마지막 00:00은 다음날 00:00을 붙여줌
-    def build_series_for_kw(kw: str):
-        dkw = df[df["keyword"] == kw].copy()
-        if dkw.empty:
-            return {"dates": [], "series": []}
+def build_report(hist: pd.DataFrame, maps: List[str], days_for_report: int) -> str:
+    # 데이터 없는 맵은 그래도 목록엔 표시
+    maps_sorted = maps[:]
 
-        agg = dkw.groupby(["date", "weekday", "hour"], as_index=False).agg(
-            price=("price", "mean"),
-            trade=("tradeCount", "mean"),
-        )
-        key = {}
-        for _, r in agg.iterrows():
-            key[(r["date"], int(r["hour"]))] = (r["price"], r["trade"], r["weekday"])
+    # JS용 데이터 구성
+    all_series: Dict[str, List[Dict[str, Any]]] = {}
+    weekday_extrema: Dict[str, List[Dict[str, Any]]] = {}
 
-        dates_sorted = sorted(agg["date"].unique())
-        series = []
-        for d in dates_sorted:
-            d_dt = pd.to_datetime(d)
-            d_next = (d_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    for kw in maps_sorted:
+        packs = build_series_for_kw(hist, kw, days_for_report)
+        all_series[kw] = [{
+            "label": p.label,
+            "x": p.x,
+            "y": p.y,
+            "hover": p.hover
+        } for p in packs]
 
-            # 요일
-            w = None
-            for h in range(1, 24):
-                v = key.get((d, h))
-                if v:
-                    w = v[2]
-                    break
-            if w is None:
-                v0 = key.get((d, 0))
-                w = v0[2] if v0 else ""
+        weekday_extrema[kw] = compute_weekday_extrema(hist, kw, days_for_report)
 
-            label = f"{d}({w})" if w else d
-
-            x = [f"{h:02d}:00" for h in range(1, 24)] + ["00:00"]
-            y = []
-            hover = []  # (시간,가격문자,거래문자,기준날짜)
-
-            # 01~23은 d
-            for h in range(1, 24):
-                v = key.get((d, h))
-                if v:
-                    price, trade, _ = v
-                    y.append(float(price))
-                    hover.append((f"{h:02d}:00", format_price_kr(price), f"{int(round(trade))}건" if pd.notna(trade) else "", d))
-                else:
-                    y.append(None)
-                    hover.append((f"{h:02d}:00", "-", "", d))
-
-            # 마지막 00:00은 다음날 00:00
-            v00 = key.get((d_next, 0))
-            if v00:
-                price, trade, _ = v00
-                y.append(float(price))
-                hover.append(("00:00", format_price_kr(price), f"{int(round(trade))}건" if pd.notna(trade) else "", d_next))
-            else:
-                y.append(None)
-                hover.append(("00:00", "-", "", d_next))
-
-            series.append({"label": label, "x": x, "y": y, "hover": hover})
-
-        return {"dates": dates_sorted, "series": series}
-
-    per_kw = {kw: build_series_for_kw(kw) for kw in maps_sorted}
-
-    # HTML 생성(Plotly CDN + JS 드롭다운)
-    html = f"""<!doctype html>
+    # HTML 생성 (⚠ f-string 충돌 방지: plotly %{...} 는 %{{...}}로 작성)
+    # 브레이스 충돌이 나지 않도록, python은 f-string을 최소화하고 .format 사용
+    html = """<!doctype html>
 <html lang="ko">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>MaShop 사냥터 시세 대시보드</title>
-  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
-  <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, "Malgun Gothic", sans-serif; margin: 16px; }}
-    .row {{ display:flex; gap:12px; flex-wrap:wrap; align-items:center; }}
-    select, button {{ padding:8px 10px; font-size:14px; }}
-    .card {{ border:1px solid #ddd; border-radius:10px; padding:12px; margin-top:12px; }}
-    .small {{ color:#666; font-size:12px; }}
-    .rec li {{ margin: 6px 0; }}
-    .pill {{ display:inline-block; padding:2px 8px; border:1px solid #ccc; border-radius:999px; font-size:12px; margin-left:6px; color:#444; }}
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MaShop 시세 대시보드</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  body {{
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", Arial, sans-serif;
+    background: #0b0f14;
+    color: #e8eef6;
+  }}
+  .wrap {{
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 18px;
+  }}
+  .top {{
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }}
+  h1 {{
+    font-size: 18px;
+    margin: 0;
+    font-weight: 700;
+  }}
+  .sub {{
+    color: #a7b3c2;
+    font-size: 12px;
+    margin-top: 4px;
+  }}
+  .controls {{
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }}
+  select, button {{
+    background: #111826;
+    border: 1px solid #223044;
+    color: #e8eef6;
+    padding: 8px 10px;
+    border-radius: 10px;
+    outline: none;
+    cursor: pointer;
+  }}
+  button.active {{
+    border-color: #4da3ff;
+  }}
+  .grid {{
+    display: grid;
+    grid-template-columns: 1.2fr 0.8fr;
+    gap: 12px;
+  }}
+  @media (max-width: 960px) {{
+    .grid {{ grid-template-columns: 1fr; }}
+  }}
+  .card {{
+    background: #0f1622;
+    border: 1px solid #1f2b3d;
+    border-radius: 14px;
+    padding: 12px;
+  }}
+  .small {{
+    color: #a7b3c2;
+    font-size: 12px;
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 8px;
+  }}
+  th, td {{
+    padding: 8px 6px;
+    border-bottom: 1px solid #1f2b3d;
+    font-size: 13px;
+  }}
+  th {{
+    text-align: left;
+    color: #a7b3c2;
+    font-weight: 600;
+  }}
+  td.r {{
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }}
+  .hint {{
+    color: #6f8298;
+    font-size: 12px;
+    margin-top: 8px;
+  }}
+</style>
 </head>
 <body>
-  <h2>MaShop 사냥터 시세 대시보드</h2>
-  <div class="small">최근 {days_for_report}일 기준 · 업데이트 기준시각: {max_dt.strftime("%Y-%m-%d %H:%M")} (KST)</div>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1>사냥터 시세 자동 수집기 & 분석 대시보드</h1>
+        <div class="sub">최근 <b>{days_for_report}</b>일 기반 · 요일/시간 패턴 확인</div>
+      </div>
+      <div class="controls">
+        <select id="kwSelect"></select>
+        <button class="rangeBtn" data-days="7">7일</button>
+        <button class="rangeBtn active" data-days="{days_for_report}">{days_for_report}일</button>
+        <button class="rangeBtn" data-days="30">30일</button>
+      </div>
+    </div>
 
-  <div class="card">
-    <div class="row">
-      <div><b>사냥터 선택</b></div>
-      <select id="kwSelect"></select>
-      <div class="small">추천 판매시간은 거래(평균) {MIN_TRADECOUNT}건 이상만 반영</div>
+    <div class="grid">
+      <div class="card">
+        <div id="chart" style="height:520px;"></div>
+        <div class="hint">※ 차트 점에 마우스를 올리면 <b>날짜/요일/시간/가격/거래량</b>이 표시됩니다.</div>
+      </div>
+
+      <div class="card">
+        <b>요일별 최고가 / 최저가 (평균가 기준)</b>
+        <div class="small">최근 N일 · 평균 거래량 <b>{min_trade}</b> 이상만 반영</div>
+        <div id="weekTableWrap"></div>
+      </div>
     </div>
   </div>
 
-  <div class="card">
-    <b>추천 판매시간 TOP 3</b>
-    <ul class="rec" id="recList"></ul>
-  </div>
-
-  <div class="card">
-    <b>날짜별 시간대 가격 변화</b>
-    <div class="small">x축: 01:00~23:00 + 마지막 00:00(다음날 00:00)</div>
-    <div id="chart" style="width:100%;height:520px;"></div>
-  </div>
-
 <script>
-const MAPS = {json.dumps(maps_sorted, ensure_ascii=False)};
-const DATA = {json.dumps(per_kw, ensure_ascii=False)};
-const REC  = {json.dumps(rec, ensure_ascii=False)};
+const MAPS = {maps_json};
+const SERIES = {series_json};
+const WEEK = {week_json};
+const HOUR_ORDER = {hour_order};
 
-const kwSelect = document.getElementById("kwSelect");
-const recList = document.getElementById("recList");
+function formatPriceKrFromNumber(num) {{
+  if (num === null || num === undefined || isNaN(num)) return "-";
+  const v = Number(num);
+  if (v >= 100000000) {{
+    const eok = v / 100000000;
+    const rounded = Math.round(eok * 10) / 10;
+    if (Math.abs(rounded - Math.round(rounded)) < 1e-9) return `${{Math.round(rounded)}}억`;
+    return `${{rounded}}억`;
+  }} else {{
+    const man = Math.round(v / 10000);
+    return `${{man}}만`;
+  }}
+}}
 
-function renderDropdown() {{
-  kwSelect.innerHTML = "";
-  MAPS.forEach((kw) => {{
-    const opt = document.createElement("option");
-    opt.value = kw;
-    opt.textContent = kw;
-    kwSelect.appendChild(opt);
+function setActiveRange(days) {{
+  document.querySelectorAll(".rangeBtn").forEach(btn => {{
+    btn.classList.toggle("active", String(btn.dataset.days) === String(days));
   }});
 }}
 
-function renderRecommendations(kw) {{
-  recList.innerHTML = "";
-  const items = REC[kw] || [];
-  if (!items.length) {{
-    const li = document.createElement("li");
-    li.textContent = "추천할 데이터가 부족합니다.";
-    recList.appendChild(li);
+function renderWeekTable(kw) {{
+  const rows = (WEEK[kw] || []);
+  const wrap = document.getElementById("weekTableWrap");
+
+  if (!rows.length) {{
+    wrap.innerHTML = "<div class='small' style='margin-top:10px;'>데이터가 부족합니다.</div>";
     return;
   }}
-  items.forEach((it, idx) => {{
-    const li = document.createElement("li");
-    li.innerHTML = `<b>#${{idx+1}}</b> ${{it.weekday}} ${{it.time}} · 평균 ${{it.avg_price_str}} 
-      <span class="pill">평균거래 ${{it.avg_trade}}건</span>
-      <span class="pill">표본 ${{it.n}}</span>`;
-    recList.appendChild(li);
+
+  let html = `
+    <table>
+      <thead>
+        <tr>
+          <th>요일</th>
+          <th>최고가 시간</th>
+          <th class="r">최고가(평균)</th>
+          <th>최저가 시간</th>
+          <th class="r">최저가(평균)</th>
+        </tr>
+      </thead>
+      <tbody>
+  `;
+
+  rows.forEach(r => {{
+    html += `
+      <tr>
+        <td>${{r.weekday}}</td>
+        <td>${{r.best_time}}</td>
+        <td class="r">${{r.best_price_str}}</td>
+        <td>${{r.worst_time}}</td>
+        <td class="r">${{r.worst_price_str}}</td>
+      </tr>
+    `;
   }});
+
+  html += `</tbody></table>`;
+  wrap.innerHTML = html;
 }}
 
-function renderChart(kw) {{
-  const obj = DATA[kw];
-  const series = (obj && obj.series) ? obj.series : [];
-  const traces = [];
+function buildTraces(kw, days) {{
+  const packs = (SERIES[kw] || []);
+  // days에 따라 최근 days만 보여주기(클라이언트에서 잘라서 빠르게)
+  const sliced = packs.slice(Math.max(0, packs.length - days), packs.length);
 
-  series.forEach(s => {{
-    const customdata = s.hover.map(h => [h[0], h[1], h[2], h[3]]);
+  const traces = [];
+  sliced.forEach(s => {{
+    // customdata: [time, price_str, tradeCount, date, weekday]
+    const customdata = s.hover.map(h => [h[0], h[1], h[2], h[3], h[4]]);
     traces.push({{
       x: s.x,
       y: s.y,
       type: "scatter",
       mode: "lines+markers",
       name: s.label,
-      customdata,
+      customdata: customdata,
       hovertemplate:
-          "<b>"+s.label+"</b><br>" +
-          "시간: %{{customdata[0]}}<br>" +
-          "가격: %{{customdata[1]}}<br>" +
-          "거래: %{{customdata[2]}}<br>" +
-          "기준날짜: %{{customdata[3]}}<extra></extra>",
+        "<b>" + s.label + "</b><br>" +
+        "날짜: %{{customdata[3]}} (%{{customdata[4]}})<br>" +
+        "시간: %{{customdata[0]}}<br>" +
+        "가격: %{{customdata[1]}}<br>" +
+        "거래: %{{customdata[2]}}<extra></extra>",
       connectgaps: false
     }});
   }});
+  return traces;
+}}
+
+function renderChart(kw, days) {{
+  const traces = buildTraces(kw, days);
 
   const layout = {{
     title: kw,
-    margin: {{l: 50, r: 20, t: 50, b: 50}},
+    paper_bgcolor: "#0f1622",
+    plot_bgcolor: "#0f1622",
+    font: {{ color: "#e8eef6" }},
+    margin: {{ l: 55, r: 20, t: 50, b: 50 }},
     xaxis: {{
       type: "category",
       categoryorder: "array",
-      categoryarray: {json.dumps([f"{h:02d}:00" for h in range(1,24)] + ["00:00"], ensure_ascii=False)},
-      title: "시간"
+      categoryarray: HOUR_ORDER,
+      title: "시간",
+      gridcolor: "#1f2b3d",
+      tickangle: -45
     }},
-    yaxis: {{ title: "가격" }},
+    yaxis: {{
+      title: "가격",
+      gridcolor: "#1f2b3d",
+      tickformat: ","
+    }},
     hovermode: "closest",
-    legend: {{orientation: "h"}}
+    legend: {{
+      orientation: "h"
+    }}
   }};
 
-  Plotly.newPlot("chart", traces, layout, {{displayModeBar: true, responsive: true}});
+  Plotly.newPlot("chart", traces, layout, {{
+    displayModeBar: true,
+    responsive: true
+  }});
 }}
 
-kwSelect.addEventListener("change", () => {{
-  const kw = kwSelect.value;
-  renderRecommendations(kw);
-  renderChart(kw);
-}});
+function init() {{
+  const kwSelect = document.getElementById("kwSelect");
+  MAPS.forEach(k => {{
+    const opt = document.createElement("option");
+    opt.value = k;
+    opt.textContent = k;
+    kwSelect.appendChild(opt);
+  }});
 
-renderDropdown();
-const initial = MAPS[0];
-kwSelect.value = initial;
-renderRecommendations(initial);
-renderChart(initial);
+  let currentDays = {days_for_report};
+  if (kwSelect.options.length) kwSelect.value = MAPS[0];
+
+  function rerender() {{
+    const kw = kwSelect.value;
+    renderWeekTable(kw);
+    renderChart(kw, currentDays);
+  }}
+
+  kwSelect.addEventListener("change", () => {{
+    rerender();
+  }});
+
+  document.querySelectorAll(".rangeBtn").forEach(btn => {{
+    btn.addEventListener("click", () => {{
+      currentDays = Number(btn.dataset.days);
+      setActiveRange(currentDays);
+      rerender();
+    }});
+  }});
+
+  setActiveRange(currentDays);
+  rerender();
+}}
+
+init();
 </script>
 </body>
 </html>
-"""
-    with open(DOCS_PATH, "w", encoding="utf-8") as f:
-        f.write(html)
+""".format(
+        days_for_report=days_for_report,
+        min_trade=MIN_TRADECOUNT,
+        maps_json=json.dumps(maps_sorted, ensure_ascii=False),
+        series_json=json.dumps(all_series, ensure_ascii=False),
+        week_json=json.dumps(weekday_extrema, ensure_ascii=False),
+        hour_order=json.dumps(HOUR_ORDER, ensure_ascii=False),
+    )
+
+    return html
 
 
 def main():
     ensure_dirs()
     maps = load_maps()
 
-    # 기존 누적 데이터 로드
-    hist = load_history()
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) mashop-dashboard/1.0"
+    })
 
-    # 수집 범위: 리포트 기간보다 넉넉히(00시/경계 섞임 대응)
-    end_dt = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None)
-    start_date, end_date = daterange_days(end_dt, DAYS_FOR_REPORT + 1)  # +1일 여유
+    old_hist = load_history()
 
-    new_rows = []
+    new_parts = []
     for kw in maps:
-        data = fetch_period(kw, start_date, end_date)
-        for it in data:
-            dt = parse_dt_seoul(it.get("dateTime"))
-            if pd.isna(dt):
-                continue
-            price = pd.to_numeric(it.get("price"), errors="coerce")
-            if pd.isna(price):
-                continue
+        try:
+            df_new = collect_recent(kw, DAYS_TO_FETCH, session=session)
+            if df_new is not None and not df_new.empty:
+                new_parts.append(df_new)
+            else:
+                # 데이터 없으면 그냥 스킵
+                pass
+        except Exception as e:
+            print(f"[WARN] fetch failed: {kw} -> {e}")
 
-            d = dt.strftime("%Y-%m-%d")
-            w = WEEKDAY_KR[dt.weekday()]
-            hour = int(dt.strftime("%H"))
+    if new_parts:
+        new_hist = pd.concat(new_parts, ignore_index=True)
+    else:
+        new_hist = pd.DataFrame(columns=["keyword", "mapName", "dateTime", "date", "time", "weekday", "price", "tradeCount", "timeUnit"])
 
-            new_rows.append({
-                "mapName": it.get("mapName") or kw,
-                "keyword": kw,
-                "date": d,
-                "weekday": w,
-                "hour": hour,
-                "time": f"{hour:02d}:00",
-                "dateTime": dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "price": float(price),
-                "tradeCount": pd.to_numeric(it.get("tradeCount"), errors="coerce"),
-                "timeUnit": it.get("timeUnit"),
-            })
+    merged = merge_history(old_hist, new_hist)
+    save_history(merged)
 
-    new_df = pd.DataFrame(new_rows)
-    if not new_df.empty:
-        # 누적 + 중복 제거 (사냥터+dateTime 기준)
-        merged = pd.concat([hist, new_df], ignore_index=True)
-        merged = merged.drop_duplicates(subset=["keyword", "dateTime"], keep="last")
-        merged = merged.sort_values(["keyword", "dateTime"])
-        save_history(merged)
-        hist = merged
+    html = build_report(merged, maps, DAYS_FOR_REPORT)
+    with open(INDEX_HTML_PATH, "w", encoding="utf-8") as f:
+        f.write(html)
 
-    # 리포트 생성
-    if hist.empty:
-        raise ValueError("누적 데이터가 비었습니다. (키워드/기간 확인 필요)")
-    build_report(hist, maps, DAYS_FOR_REPORT)
+    print("[OK] history.csv / index.html generated")
+    print(" -", HISTORY_CSV_PATH)
+    print(" -", INDEX_HTML_PATH)
 
 
 if __name__ == "__main__":
     main()
-
-
