@@ -3,7 +3,7 @@ name: Update dashboard
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 * * * *"   # 매시간 10분 (한국시간 아님: UTC 기준)
+    - cron: "52 * * * *"   # 매시간 52분(UTC) = 매시간 01분(KST)
 
 permissions:
   contents: write
