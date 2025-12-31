@@ -27,3 +27,5 @@ HOUR_ORDER = [f"{h:02d}:00" for h in range(1, 24)] + ["00:00"]
 # points는 클라이언트(브라우저)에서 요일평균 계산할 때 쓰는 "가벼운 점" 데이터
 POINTS_MAX_DAYS = int(os.environ.get("POINTS_MAX_DAYS", "60"))
 
+# 오래된 데이터 자동 정리(보관 기간)
+KEEP_DAYS = 180
