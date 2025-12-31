@@ -29,3 +29,6 @@ POINTS_MAX_DAYS = int(os.environ.get("POINTS_MAX_DAYS", "60"))
 
 # 오래된 데이터 자동 정리(보관 기간)
 KEEP_DAYS = 180
+
+# raw_dump 보관 기간 (일)
+RAW_KEEP_DAYS = 14
