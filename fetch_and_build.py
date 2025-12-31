@@ -297,7 +297,7 @@ function renderChart(kw) {{
       customdata,
       hovertemplate:
         "<b>"+s.label+"</b><br>" +
-        "시간: %{customdata[0]}<br>" +
+        "시간: %{{customdata[0]}}<br>" +
         "가격: %{customdata[1]}<br>" +
         "거래: %{customdata[2]}<br>" +
         "기준날짜: %{customdata[3]}<extra></extra>",
@@ -397,3 +397,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
