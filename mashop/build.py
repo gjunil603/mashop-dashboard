@@ -7,6 +7,9 @@ from typing import Any, Dict, List
 import pandas as pd
 import requests
 
+import time
+import random
+
 from .config import (
     DATA_DIR,
     DOCS_DIR,
@@ -231,20 +234,27 @@ def main():
 
     # 사냥터별로: 최근 N일 fetch -> merge -> save
     per_map_history: Dict[str, pd.DataFrame] = {}
-
-    for kw in maps:
+    
+    for i, kw in enumerate(maps):
         old_df = read_history(kw)
+    
         try:
             new_df = _collect_recent_df(session, kw, DAYS_TO_FETCH)
         except Exception as e:
             print(f"[WARN] fetch failed: {kw} -> {e}")
-            new_df = pd.DataFrame(columns=old_df.columns if old_df is not None else [])
-
+            new_df = pd.DataFrame(columns=(old_df.columns if old_df is not None else []))
+    
         merged = _merge_history(old_df, new_df)
         write_history(kw, merged)
         per_map_history[kw] = merged
-
+    
         print(f"[OK] {kw}: rows={len(merged)} (fetched={len(new_df) if new_df is not None else 0})")
+    
+        # ✅ 다음 사냥터 요청 전 랜덤 딜레이 (마지막은 제외)
+        if i < len(maps) - 1:
+            delay = random.uniform(0.8, 1.8)
+            print(f"    sleep {delay:.2f}s before next map")
+            time.sleep(delay)
 
     # 대시보드에 넣을 데이터 구성
     daily_series: Dict[str, Any] = {}
