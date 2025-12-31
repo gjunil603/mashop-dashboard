@@ -72,3 +72,46 @@ def dump_raw(keyword: str, filename: str, obj: Any) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
+def _ensure_datetime_col(df: pd.DataFrame, col: str = "dateTime") -> pd.Series:
+    """
+    df[col]을 pandas datetime으로 안전하게 변환한 Series 반환
+    """
+    if df is None or df.empty or col not in df.columns:
+        return pd.Series([], dtype="datetime64[ns]")
+    return pd.to_datetime(df[col], errors="coerce")
+
+
+def trim_history_days(df: pd.DataFrame, keep_days: int, col: str = "dateTime") -> pd.DataFrame:
+    """
+    history DataFrame을 최근 keep_days만 남기도록 정리
+    - 기준 시점: df의 가장 최신 dateTime (현재시간 기준이 아니라 데이터 기준)
+    - dateTime 파싱 실패 행은 제거(안전)
+    """
+    if df is None or df.empty:
+        return df
+
+    if col not in df.columns:
+        return df
+
+    ts = _ensure_datetime_col(df, col)
+    if ts.empty:
+        return df.iloc[0:0].copy()
+
+    # 파싱 실패(NaT) 제거
+    valid_mask = ts.notna()
+    df2 = df.loc[valid_mask].copy()
+    ts2 = ts.loc[valid_mask]
+
+    if df2.empty:
+        return df2
+
+    latest = ts2.max()
+    cutoff = latest - pd.Timedelta(days=int(keep_days))
+
+    keep_mask = ts2 >= cutoff
+    df3 = df2.loc[keep_mask].copy()
+
+    # 정렬(있으면 안정적)
+    df3[col] = pd.to_datetime(df3[col], errors="coerce")
+    df3 = df3.sort_values(col).reset_index(drop=True)
+    return df3
