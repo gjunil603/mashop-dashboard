@@ -8,6 +8,7 @@ from typing import Tuple
 
 from .config import WEEKDAY_KR
 
+KST = ZoneInfo("Asia/Seoul")
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -50,13 +51,29 @@ def weekday_kr(dt: datetime) -> str:
     return WEEKDAY_KR[dt.weekday()]
 
 
-def last_n_days_range(n: int, include_today: bool = True) -> Tuple[str, str]:
-    today = date.today()
+def last_n_days_range(days: int, include_today: bool = True) -> tuple[str, str]:
+    """
+    KST(한국시간) 기준으로 start/end 날짜(YYYY-MM-DD)를 반환.
+
+    - include_today=True:
+        end = 오늘(KST)
+        start = 오늘(KST) - days
+      예) days=7 -> 8일치 범위가 될 수 있음(시작/끝 포함)
+
+    - include_today=False:
+        end = 어제(KST)
+        start = 어제(KST) - (days-1)
+
+    반환값은 API 파라미터에 그대로 사용.
+    """
+    today_kst: date = datetime.now(KST).date()
+
     if include_today:
-        start = today - timedelta(days=n - 1)
-        end = today
+        end = today_kst
+        start = today_kst - timedelta(days=int(days))
     else:
-        start = today - timedelta(days=n)
-        end = today - timedelta(days=1)
+        end = today_kst - timedelta(days=1)
+        start = end - timedelta(days=max(int(days) - 1, 0))
+
     return start.isoformat(), end.isoformat()
 
