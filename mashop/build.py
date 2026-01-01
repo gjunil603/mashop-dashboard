@@ -10,6 +10,8 @@ import requests
 import time
 import random
 
+from zoneinfo import ZoneInfo
+
 from .config import (
     DATA_DIR,
     DOCS_DIR,
@@ -32,7 +34,9 @@ from mashop.storage import trim_history_days
 def _collect_recent_df(session: requests.Session, keyword: str, days_to_fetch: int) -> pd.DataFrame:
     start_date, end_date = last_n_days_range(days_to_fetch, include_today=True)
     rows = fetch_period(session, keyword, start_date, end_date)
-
+    
+    print(f"[FETCH] {keyword} start={start_date} end={end_date}") #로그
+    
     dump_raw(keyword, f"{start_date}_to_{end_date}.json", rows)
 
     out = []
@@ -190,7 +194,9 @@ def build_points(df: pd.DataFrame, max_days: int) -> List[Dict[str, Any]]:
     if sub.empty:
         return []
 
-    cutoff = datetime.now() - timedelta(days=max_days)
+    KST = ZoneInfo("Asia/Seoul")
+
+    cutoff = datetime.now(KST).replace(tzinfo=None) - timedelta(days=max_days)
     sub = sub[sub["dt"] >= cutoff]
     if sub.empty:
         return []
