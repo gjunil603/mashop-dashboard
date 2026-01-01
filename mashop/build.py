@@ -253,12 +253,27 @@ def main():
             new_df = pd.DataFrame(columns=(old_df.columns if old_df is not None else []))
     
         merged = _merge_history(old_df, new_df)
-        # ✅ 오래된 데이터 자동 정리 (최근 180일만 유지)
-        merged = trim_history_days(merged, KEEP_DAYS)
-        write_history(kw, merged)
-        per_map_history[kw] = merged
-    
-        print(f"[OK] {kw}: rows={len(merged)} (fetched={len(new_df) if new_df is not None else 0})")
+
+        before_trim = len(merged)
+        merged_trim = trim_history_days(merged, KEEP_DAYS)
+        after_trim = len(merged_trim)
+        
+        # ✅ 안전장치: trim 결과가 너무 작아지면(파싱 문제 등) 기존 merged를 사용
+        #   (예: 새로 fetched가 100개 이상인데 trim 후가 50개 이하면 이상)
+        if (new_df is not None and len(new_df) >= 50) and (after_trim < 0.7 * before_trim):
+            print(f"[WARN] trim looks suspicious: before={before_trim} after={after_trim} -> keep untrimmed")
+            merged_final = merged
+        else:
+            merged_final = merged_trim
+        
+        write_history(kw, merged_final)
+        per_map_history[kw] = merged_final
+        
+        print(
+            f"[OK] {kw}: old={len(old_df) if old_df is not None else 0} "
+            f"fetched={len(new_df) if new_df is not None else 0} "
+            f"merged={before_trim} trimmed={len(merged_final)}"
+        )
     
         # ✅ 다음 사냥터 요청 전 랜덤 딜레이 (마지막은 제외)
         if i < len(maps) - 1:
