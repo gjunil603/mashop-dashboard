@@ -21,8 +21,8 @@ INDEX_HTML_PATH = os.path.join(DOCS_DIR, "index.html")
 
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
-# 사이트처럼 01:00 시작 ~ 23:00, 마지막에 00:00
-HOUR_ORDER = [f"{h:02d}:00" for h in range(1, 24)] + ["00:00"]
+# 보기 편하게 00:00 시작 ~ 23:00
+HOUR_ORDER = ["00:00"] + [f"{h:02d}:00" for h in range(1, 24)]
 
 # points는 클라이언트(브라우저)에서 요일평균 계산할 때 쓰는 "가벼운 점" 데이터
 POINTS_MAX_DAYS = int(os.environ.get("POINTS_MAX_DAYS", "60"))
