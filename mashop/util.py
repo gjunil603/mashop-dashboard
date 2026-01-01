@@ -6,6 +6,8 @@ import re
 from datetime import date, timedelta, datetime
 from typing import Tuple
 
+from zoneinfo import ZoneInfo
+
 from .config import WEEKDAY_KR
 
 KST = ZoneInfo("Asia/Seoul")
