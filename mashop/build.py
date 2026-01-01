@@ -33,10 +33,12 @@ from mashop.storage import trim_history_days
 
 def _collect_recent_df(session: requests.Session, keyword: str, days_to_fetch: int) -> pd.DataFrame:
     start_date, end_date = last_n_days_range(days_to_fetch, include_today=True)
+
+    # ✅ 요청 범위 로그(요청 직전에 찍는 게 더 직관적)
+    print(f"[FETCH] {keyword} start={start_date} end={end_date}")
+
     rows = fetch_period(session, keyword, start_date, end_date)
-    
-    print(f"[FETCH] {keyword} start={start_date} end={end_date}") #로그
-    
+
     dump_raw(keyword, f"{start_date}_to_{end_date}.json", rows)
 
     out = []
@@ -66,10 +68,21 @@ def _collect_recent_df(session: requests.Session, keyword: str, days_to_fetch: i
         )
 
     df = pd.DataFrame(out)
+
     if not df.empty:
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
         df["tradeCount"] = pd.to_numeric(df["tradeCount"], errors="coerce")
+
+        # ✅ 실제로 받은 데이터의 최소/최대 시간 확인 로그
+        print(
+            f"[FETCH_MAX] {keyword} min={df['dateTime'].min()} "
+            f"max={df['dateTime'].max()} rows={len(df)}"
+        )
+    else:
+        print(f"[FETCH_MAX] {keyword} empty rows=0")
+
     return df
+
 
 
 def _merge_history(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
