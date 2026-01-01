@@ -6,7 +6,7 @@ API_BASE = "https://api.mashop.kr"
 DEFAULT_DAYS_FOR_UI = int(os.environ.get("DAYS_FOR_REPORT", "14"))
 
 # 매 실행마다 API에서 가져와서 누적 갱신할 기간(최근 N일)
-DAYS_TO_FETCH = int(os.environ.get("DAYS_TO_FETCH", "30"))
+DAYS_TO_FETCH = int(os.environ.get("DAYS_TO_FETCH", "7"))
 
 # 요일 평균/최고최저 계산에서 평균 거래량이 너무 적으면 제외(노이즈 방지)
 MIN_TRADECOUNT = float(os.environ.get("MIN_TRADECOUNT", "5"))
