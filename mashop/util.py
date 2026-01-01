@@ -44,9 +44,30 @@ def windows_safe_slug(name: str, max_len: int = 80) -> str:
     return s
 
 
-def parse_dt(dt_str: str) -> datetime:
-    # 예: "2025-12-31T01:00:00" (TZ 정보 없음)
-    return datetime.fromisoformat(dt_str)
+def parse_dt(s: str) -> datetime:
+    """
+    mashop API dateTime 파싱 규칙:
+    - timezone 정보가 없는 ISO 문자열은 KST로 간주한다. (사이트 표시와 일치)
+    - timezone(Z 또는 +09:00 등)가 있으면 그걸 존중하고 KST로 변환한다.
+    - 반환은 'KST 기준 naive datetime' (tzinfo 제거)로 통일한다.
+    """
+    s = (s or "").strip()
+
+    # 1) 가장 흔한 ISO 형태 처리
+    #    Python fromisoformat은 'Z'를 직접 못 먹어서 +00:00으로 치환
+    s2 = s.replace("Z", "+00:00")
+
+    dt = datetime.fromisoformat(s2)
+
+    # 2) tzinfo가 없으면 KST로 붙이기
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=KST)
+    else:
+        # tz가 있으면 KST로 변환
+        dt = dt.astimezone(KST)
+
+    # 3) 내부 저장/비교는 naive(KST)로 통일
+    return dt.replace(tzinfo=None)
 
 
 def weekday_kr(dt: datetime) -> str:
