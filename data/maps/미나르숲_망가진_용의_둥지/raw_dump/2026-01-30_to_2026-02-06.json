@@ -1195,5 +1195,12 @@
     "dateTime": "2026-02-05T18:00:00",
     "timeUnit": "HOURLY",
     "tradeCount": 10
+  },
+  {
+    "mapName": "미나르숲:망가진 용의 둥지",
+    "price": 516851,
+    "dateTime": "2026-02-05T19:00:00",
+    "timeUnit": "HOURLY",
+    "tradeCount": 6
   }
 ]
