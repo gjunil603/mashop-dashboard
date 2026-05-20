@@ -1307,5 +1307,26 @@
     "dateTime": "2026-05-20T10:00:00",
     "timeUnit": "HOURLY",
     "tradeCount": 19
+  },
+  {
+    "mapName": "미나르숲:남겨진 용의 둥지",
+    "price": 6317391,
+    "dateTime": "2026-05-20T11:00:00",
+    "timeUnit": "HOURLY",
+    "tradeCount": 24
+  },
+  {
+    "mapName": "미나르숲:남겨진 용의 둥지",
+    "price": 7312499,
+    "dateTime": "2026-05-20T12:00:00",
+    "timeUnit": "HOURLY",
+    "tradeCount": 19
+  },
+  {
+    "mapName": "미나르숲:남겨진 용의 둥지",
+    "price": 6750000,
+    "dateTime": "2026-05-20T13:00:00",
+    "timeUnit": "HOURLY",
+    "tradeCount": 21
   }
 ]
