@@ -1181,5 +1181,26 @@
     "dateTime": "2026-05-22T16:00:00",
     "timeUnit": "HOURLY",
     "tradeCount": 7
+  },
+  {
+    "mapName": "아쿠아로드:깊은 바다 협곡2",
+    "price": 3749999,
+    "dateTime": "2026-05-22T17:00:00",
+    "timeUnit": "HOURLY",
+    "tradeCount": 6
+  },
+  {
+    "mapName": "아쿠아로드:깊은 바다 협곡2",
+    "price": 5812499,
+    "dateTime": "2026-05-22T18:00:00",
+    "timeUnit": "HOURLY",
+    "tradeCount": 9
+  },
+  {
+    "mapName": "아쿠아로드:깊은 바다 협곡2",
+    "price": 3333333,
+    "dateTime": "2026-05-22T19:00:00",
+    "timeUnit": "HOURLY",
+    "tradeCount": 9
   }
 ]
